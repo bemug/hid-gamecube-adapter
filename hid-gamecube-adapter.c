@@ -389,7 +389,7 @@ static int gamecube_fixup_urb_in(struct gamecube_adpt *adpt)
 	struct hid_device *hdev = adpt->hdev;
 	struct usbhid_device *usbhid;
 
-	if (!hid_is_using_ll_driver(hdev, &usb_hid_driver))
+	if (!hid_is_usb(hdev))
 		return -EINVAL;
 	usbhid = hdev->driver_data;
 	if (usbhid->urbin->transfer_buffer_length < GC_INPUT_REPORT_SIZE)
