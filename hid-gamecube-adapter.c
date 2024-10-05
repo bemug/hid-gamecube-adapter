@@ -20,7 +20,8 @@
 #include "usbhid/usbhid.h"
 
 enum gamecube_output {
-	GC_CMD_INIT = 0x13
+	GC_CMD_INIT = 0x13,
+	GC_CMD_RUMBLE = 0x11
 };
 
 enum gamecube_input {
@@ -55,13 +56,17 @@ struct gamecube_ctrl {
 	struct input_dev __rcu *input;
 	struct gamecube_adpt *adpt;
 	enum gamecube_ctrl_flags flags;
+	u8 rumble;
 	struct work_struct work_connect;
 	spinlock_t flags_lock;
+	spinlock_t rumble_lock;
 };
 
 struct gamecube_adpt {
 	struct gamecube_ctrl ctrls[4];
 	struct hid_device *hdev;
+	struct work_struct work_rumble;
+	u8 rumble;
 };
 
 static int gamecube_hid_send(struct hid_device *hdev, const u8 *data, size_t n)
@@ -83,6 +88,61 @@ static int gamecube_send_cmd_init(struct hid_device *hdev)
 
 	return gamecube_hid_send(hdev, initcmd, sizeof(initcmd));
 }
+
+#ifdef CONFIG_HID_GAMECUBE_ADAPTER_FF
+static int gamecube_send_cmd_rumble(struct gamecube_adpt *adpt)
+{
+	struct gamecube_ctrl *ctrls = adpt->ctrls;
+	u8 cmd[5] = {GC_CMD_RUMBLE};
+	unsigned long flags;
+	unsigned int i;
+	int rumble_ok;
+	u8 rumble = 0;
+
+	for (i = 0; i < 4; i++) {
+		spin_lock_irqsave(&ctrls[i].flags_lock, flags);
+		rumble_ok = (ctrls[i].flags & GC_TYPES)
+			&& (ctrls[i].flags & GC_FLAG_EXTRAPOWER);
+		spin_unlock_irqrestore(&ctrls[i].flags_lock, flags);
+		if (!rumble_ok)
+			continue;
+		spin_lock_irqsave(&ctrls[i].rumble_lock, flags);
+		cmd[i + 1] = ctrls[i].rumble;
+		rumble |= (ctrls[i].rumble & 1U) << i;
+		spin_unlock_irqrestore(&ctrls[i].rumble_lock, flags);
+	}
+	if (rumble == adpt->rumble)
+		return 0;
+	adpt->rumble = rumble;
+	return gamecube_hid_send(adpt->hdev, cmd, sizeof(cmd));
+}
+
+static void gamecube_rumble_worker(struct work_struct *work)
+{
+	struct gamecube_adpt *adpt = container_of(work, struct gamecube_adpt,
+						  work_rumble);
+
+	gamecube_send_cmd_rumble(adpt);
+}
+
+static int gamecube_rumble_play(struct input_dev *dev, void *data,
+							 struct ff_effect *eff)
+{
+	struct gamecube_ctrl *ctrl = input_get_drvdata(dev);
+	struct gamecube_adpt *adpt = ctrl->adpt;
+	unsigned long flags;
+
+	if (eff->type != FF_RUMBLE)
+		return 0;
+
+	spin_lock_irqsave(&ctrl->rumble_lock, flags);
+	ctrl->rumble = (eff->u.rumble.strong_magnitude
+			|| eff->u.rumble.weak_magnitude);
+	spin_unlock_irqrestore(&ctrl->rumble_lock, flags);
+	schedule_work(&adpt->work_rumble);
+	return 0;
+}
+#endif
 
 static const unsigned int gamecube_buttons[] = {
 	BTN_START, BTN_TR2, BTN_TR, BTN_TL,
@@ -136,6 +196,13 @@ static int gamecube_ctrl_create(struct gamecube_ctrl *ctrl, u8 type)
 		input_set_capability(input, EV_KEY, gamecube_buttons[i]);
 	for (i = 0; i < ARRAY_SIZE(gamecube_axes); i++)
 		input_set_abs_params(input, gamecube_axes[i], 0, 255, 0, 0);
+#ifdef CONFIG_HID_GAMECUBE_ADAPTER_FF
+	if (type == GC_TYPE_NORMAL) {
+		input_set_capability(input, EV_FF, FF_RUMBLE);
+		if (input_ff_create_memless(input, NULL, gamecube_rumble_play))
+			hid_warn(hdev, "failed to create ff memless\n");
+	}
+#endif
 
 	ret = input_register_device(input);
 	if (ret)
@@ -278,7 +345,12 @@ static struct gamecube_adpt *gamecube_adpt_create(struct hid_device *hdev)
 		ctrl->adpt = adpt;
 		INIT_WORK(&ctrl->work_connect, gamecube_work_connect_cb);
 		spin_lock_init(&ctrl->flags_lock);
+		spin_lock_init(&ctrl->rumble_lock);
 	}
+#ifdef CONFIG_HID_GAMECUBE_ADAPTER_FF
+	INIT_WORK(&adpt->work_rumble, gamecube_rumble_worker);
+	adpt->rumble = 0;
+#endif
 
 	return adpt;
 }
@@ -289,6 +361,9 @@ static void gamecube_adpt_destroy(struct gamecube_adpt *adpt)
 
 	for (i = 0; i < 4; i++)
 		gamecube_ctrl_destroy(adpt->ctrls + i);
+#ifdef CONFIG_HID_GAMECUBE_ADAPTER_FF
+	cancel_work_sync(&adpt->work_rumble);
+#endif
 	hid_hw_close(adpt->hdev);
 	hid_hw_stop(adpt->hdev);
 	kfree(adpt);
