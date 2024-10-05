@@ -56,6 +56,8 @@ struct gamecube_ctrl {
 	struct input_dev __rcu *input;
 	struct gamecube_adpt *adpt;
 	enum gamecube_ctrl_flags flags;
+	u8 axis_min[6];
+	u8 axis_max[6];
 	u8 rumble;
 	struct work_struct work_connect;
 	spinlock_t flags_lock;
@@ -264,6 +266,7 @@ static void gamecube_ctrl_handle_report(struct gamecube_ctrl *ctrl, u8 *data)
 	u16 btns = data[1] << 8 | data[2];
 	u8 old_flags, new_flags = data[0];
 	unsigned long irq_flags;
+	unsigned int i;
 
 	spin_lock_irqsave(&ctrl->flags_lock, irq_flags);
 	old_flags = ctrl->flags;
@@ -271,6 +274,11 @@ static void gamecube_ctrl_handle_report(struct gamecube_ctrl *ctrl, u8 *data)
 	spin_unlock_irqrestore(&ctrl->flags_lock, irq_flags);
 
 	if ((new_flags & GC_TYPES) != (old_flags & GC_TYPES)) {
+		// Reset min/max values. The default values were obtained empirically
+		for (i = 0; i < 6; i++) {
+			ctrl->axis_min[i] = 45; // max across all axes of min values
+			ctrl->axis_max[i] = 215; // min across all axes of max values
+		}
 		schedule_work(&ctrl->work_connect);
 		return;
 	}
@@ -294,12 +302,16 @@ static void gamecube_ctrl_handle_report(struct gamecube_ctrl *ctrl, u8 *data)
 	input_report_key(dev, BTN_DPAD_RIGHT, btns & GC_BTN_DPAD_RIGHT);
 	input_report_key(dev, BTN_DPAD_DOWN, btns & GC_BTN_DPAD_DOWN);
 	input_report_key(dev, BTN_DPAD_UP, btns & GC_BTN_DPAD_UP);
-	input_report_abs(dev, ABS_X, data[3]);
-	input_report_abs(dev, ABS_Y, 255 - data[4]);
-	input_report_abs(dev, ABS_RX, data[5]);
-	input_report_abs(dev, ABS_RY, 255 - data[6]);
-	input_report_abs(dev, ABS_Z, data[7]);
-	input_report_abs(dev, ABS_RZ, data[8]);
+	for (i = 0; i < 6; i++) {
+		u8 a, b, v = data[3 + i];
+
+		a = ctrl->axis_min[i] = min(ctrl->axis_min[i], v);
+		b = ctrl->axis_max[i] = max(ctrl->axis_max[i], v);
+		v = 255U * (v - a) / (b - a);
+		if (gamecube_axes[i] == ABS_Y || gamecube_axes[i] == ABS_RY)
+			v = 255U - v;
+		input_report_abs(dev, gamecube_axes[i], v);
+	}
 	input_sync(dev);
 
 unlock:
