@@ -452,6 +452,14 @@ err:
 	return ret;
 }
 
+#ifdef CONFIG_PM
+static int gamecube_resume(struct hid_device *hdev)
+{
+	gamecube_send_cmd_init(hdev);
+	return 0;
+}
+#endif
+
 static void gamecube_hid_remove(struct hid_device *hdev)
 {
 	struct gamecube_adpt *adpt = hid_get_drvdata(hdev);
@@ -473,6 +481,9 @@ static struct hid_driver gamecube_hid_driver = {
 	.probe		= gamecube_hid_probe,
 	.remove		= gamecube_hid_remove,
 	.raw_event	= gamecube_hid_event,
+#ifdef CONFIG_PM
+	.reset_resume	= gamecube_resume,
+#endif
 };
 module_hid_driver(gamecube_hid_driver);
 
